@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         B站视频自由缩放
 // @namespace    https://github.com/Wan-JD/bilibili-video-resizer
-// @version      1.0.0
-// @description  在 B 站普通网页模式下拖动视频边框，自由拉伸播放器画幅比例与尺寸。
+// @version      1.0.1
+// @description  在 B 站普通网页模式下拖动播放器边框，自由拉伸整块播放区域的画幅比例与尺寸。
 // @author       Wan-JD
 // @license      MIT
 // @homepageURL  https://github.com/Wan-JD/bilibili-video-resizer
@@ -25,29 +25,53 @@
 
   const STORAGE_KEY = 'bilibili_video_resizer_state';
   const SCRIPT_CLASS = 'bvr-enabled';
+  const DISABLED_CLASS = 'bvr-disabled';
   const HANDLE_CLASS = 'bvr-handle';
   const ACTIVE_CLASS = 'bvr-resizing';
   const MIN_WIDTH = 420;
   const MIN_HEIGHT = 236;
-  const EDGE_SIZE = 10;
+  const EDGE_SIZE = 14;
   const SAVE_DELAY = 160;
-  const PLAYER_SELECTORS = [
-    '#bilibili-player',
-    '#playerWrap',
-    '#player_module',
+  const PLAYER_SURFACE_SELECTORS = [
     '.bpx-player-container',
+    '#bilibili-player',
     '.bilibili-player',
-    '.player-wrap',
-    '.player-container',
+    '.bilibili-player-video-wrap',
+    '.bpx-player-video-wrap',
   ];
-  const OUTER_SELECTORS = [
+  const PLAYER_FRAME_SELECTORS = [
     '#playerWrap',
     '#player_module',
     '#bilibili-player',
     '.bpx-player-container',
-    '.bilibili-player',
+    '.player-section',
     '.player-wrap',
     '.player-container',
+    '.video-player',
+    '.video-player-container',
+    '.player-box',
+    '.bilibili-player',
+  ];
+  const PAGE_WIDTH_SELECTORS = [
+    '.left-container',
+    '.video-left-container',
+    '.video-container-v1 .left-container',
+    '.video-container .left-container',
+    '.playlist-container--left',
+    '.player-left',
+  ];
+  const SIZE_TARGET_SELECTORS = [
+    '#playerWrap',
+    '#player_module',
+    '#bilibili-player',
+    '.bpx-player-container',
+    '.player-section',
+    '.player-wrap',
+    '.player-container',
+    '.video-player',
+    '.video-player-container',
+    '.player-box',
+    '.bilibili-player',
   ];
   const FULLSCREEN_SELECTORS = [
     '.mode-webfullscreen',
@@ -62,12 +86,14 @@
   const HANDLE_DIRECTIONS = ['n', 'e', 's', 'w', 'ne', 'nw', 'se', 'sw'];
 
   let player = null;
-  let resizeTargets = [];
+  let sizeTargets = [];
+  let pageWidthTargets = [];
   let observer = null;
   let routeTimer = null;
   let saveTimer = null;
   let currentVideoKey = null;
   let dragState = null;
+  let layoutSuspended = false;
 
   function getStorage() {
     try {
@@ -114,15 +140,44 @@
     return null;
   }
 
-  function findPlayer() {
-    for (const selector of PLAYER_SELECTORS) {
-      const el = document.querySelector(selector);
-      if (isUsablePlayer(el)) return el;
-    }
+  function matchesAny(el, selectors) {
+    return !!(el?.matches && selectors.some((selector) => el.matches(selector)));
+  }
 
+  function collectAncestors(el) {
+    const nodes = [];
+    let node = el;
+    while (node && node !== document.body) {
+      if (node instanceof HTMLElement) nodes.push(node);
+      node = node.parentElement;
+    }
+    return nodes;
+  }
+
+  function findPlayer() {
     const video = document.querySelector('.bpx-player-container video, #bilibili-player video, video');
     if (!video) return null;
-    return closestMatch(video, PLAYER_SELECTORS) || video.parentElement;
+    const candidates = collectAncestors(video)
+      .filter((el) => matchesAny(el, PLAYER_FRAME_SELECTORS))
+      .filter(isUsablePlayer);
+
+    if (candidates.length) {
+      const videoRect = video.getBoundingClientRect();
+      const frameLike = candidates.filter((el) => {
+        const rect = el.getBoundingClientRect();
+        const maxWidth = Math.max(videoRect.width + 140, videoRect.width * 1.35);
+        const maxHeight = Math.max(videoRect.height + 140, videoRect.height * 1.45);
+        return rect.width <= maxWidth && rect.height <= maxHeight;
+      });
+      const pool = frameLike.length ? frameLike : candidates;
+      return pool.reduce((best, el) => {
+        const bestRect = best.getBoundingClientRect();
+        const rect = el.getBoundingClientRect();
+        return rect.width * rect.height > bestRect.width * bestRect.height ? el : best;
+      });
+    }
+
+    return closestMatch(video, PLAYER_SURFACE_SELECTORS) || video.parentElement;
   }
 
   function isUsablePlayer(el) {
@@ -131,17 +186,29 @@
     return rect.width > 240 && rect.height > 130;
   }
 
-  function findResizeTargets(base) {
-    const targets = new Set();
+  function findResizeModel(base) {
+    const sizeSet = new Set();
+    const pageWidthSet = new Set();
     const video = base.querySelector?.('video');
-    const playerContainer = closestMatch(video || base, PLAYER_SELECTORS) || base;
-    const outer = closestMatch(playerContainer, OUTER_SELECTORS);
+    const surface = closestMatch(video || base, PLAYER_SURFACE_SELECTORS) || base;
 
-    [outer, playerContainer, base].forEach((el) => {
-      if (el && el instanceof HTMLElement) targets.add(el);
+    [surface, base].forEach((el) => {
+      if (el && el instanceof HTMLElement) sizeSet.add(el);
     });
 
-    return Array.from(targets).filter(isUsablePlayer);
+    collectAncestors(base).forEach((el) => {
+      if (matchesAny(el, SIZE_TARGET_SELECTORS)) sizeSet.add(el);
+      if (matchesAny(el, PAGE_WIDTH_SELECTORS)) pageWidthSet.add(el);
+    });
+
+    base.querySelectorAll?.(PLAYER_SURFACE_SELECTORS.join(',')).forEach((el) => {
+      if (el instanceof HTMLElement) sizeSet.add(el);
+    });
+
+    return {
+      sizeTargets: Array.from(sizeSet).filter(isUsablePlayer),
+      pageWidthTargets: Array.from(pageWidthSet).filter(isUsablePlayer),
+    };
   }
 
   function isFullscreenLike() {
@@ -169,14 +236,21 @@
   }
 
   function applySize(width, height, persist = true) {
-    if (!resizeTargets.length || isFullscreenLike()) return;
+    if (!sizeTargets.length || isFullscreenLike()) return;
     const size = clampSize(width, height);
 
-    resizeTargets.forEach((el) => {
+    sizeTargets.forEach((el) => {
       el.style.setProperty('width', `${size.width}px`, 'important');
       el.style.setProperty('height', `${size.height}px`, 'important');
       el.style.setProperty('max-width', 'none', 'important');
       el.style.setProperty('aspect-ratio', `${size.width} / ${size.height}`, 'important');
+    });
+
+    pageWidthTargets.forEach((el) => {
+      el.style.setProperty('width', `${size.width}px`, 'important');
+      el.style.setProperty('max-width', 'none', 'important');
+      el.style.setProperty('min-width', `${Math.min(size.width, window.innerWidth - 32)}px`, 'important');
+      el.style.setProperty('flex-basis', `${size.width}px`, 'important');
     });
 
     document.documentElement.style.setProperty('--bvr-width', `${size.width}px`);
@@ -185,11 +259,17 @@
   }
 
   function clearSize() {
-    resizeTargets.forEach((el) => {
+    sizeTargets.forEach((el) => {
       el.style.removeProperty('width');
       el.style.removeProperty('height');
       el.style.removeProperty('max-width');
       el.style.removeProperty('aspect-ratio');
+    });
+    pageWidthTargets.forEach((el) => {
+      el.style.removeProperty('width');
+      el.style.removeProperty('max-width');
+      el.style.removeProperty('min-width');
+      el.style.removeProperty('flex-basis');
     });
     document.documentElement.style.removeProperty('--bvr-width');
     document.documentElement.style.removeProperty('--bvr-height');
@@ -226,6 +306,13 @@
     showHint('已重置播放器尺寸');
   }
 
+  function cursorForDirection(direction) {
+    if (direction === 'n' || direction === 's') return 'ns-resize';
+    if (direction === 'e' || direction === 'w') return 'ew-resize';
+    if (direction === 'ne' || direction === 'sw') return 'nesw-resize';
+    return 'nwse-resize';
+  }
+
   function showHint(text) {
     if (!player) return;
     let hint = player.querySelector('.bvr-hint');
@@ -253,7 +340,7 @@
       const handle = document.createElement('div');
       handle.className = `${HANDLE_CLASS} bvr-${direction}`;
       handle.dataset.direction = direction;
-      handle.title = direction.includes('s') || direction.includes('n') ? '拖动缩放视频画幅，双击重置' : '拖动缩放视频画幅';
+      handle.title = '拖动缩放整块播放区域，双击重置';
       handle.addEventListener('pointerdown', startResize);
       handle.addEventListener('dblclick', (event) => {
         event.preventDefault();
@@ -282,6 +369,7 @@
     event.preventDefault();
     event.stopPropagation();
     event.currentTarget.setPointerCapture?.(event.pointerId);
+    document.documentElement.style.setProperty('--bvr-cursor', cursorForDirection(direction));
     document.documentElement.classList.add(ACTIVE_CLASS);
     document.addEventListener('pointermove', onResizeMove, true);
     document.addEventListener('pointerup', stopResize, true);
@@ -315,9 +403,16 @@
     event?.stopPropagation?.();
     dragState = null;
     document.documentElement.classList.remove(ACTIVE_CLASS);
+    document.documentElement.style.removeProperty('--bvr-cursor');
     document.removeEventListener('pointermove', onResizeMove, true);
     document.removeEventListener('pointerup', stopResize, true);
     document.removeEventListener('pointercancel', stopResize, true);
+  }
+
+  function cleanupPlayer(el) {
+    if (!el) return;
+    el.classList.remove(SCRIPT_CLASS, DISABLED_CLASS);
+    el.querySelectorAll(`.${HANDLE_CLASS}, .bvr-hint`).forEach((node) => node.remove());
   }
 
   function refresh() {
@@ -326,17 +421,30 @@
 
     const routeChanged = currentVideoKey !== getVideoKey();
     if (nextPlayer !== player || routeChanged) {
-      if (nextPlayer !== player) player?.classList.remove(SCRIPT_CLASS);
+      clearSize();
+      if (nextPlayer !== player) cleanupPlayer(player);
       player = nextPlayer;
-      resizeTargets = findResizeTargets(player);
+      const model = findResizeModel(player);
+      sizeTargets = model.sizeTargets;
+      pageWidthTargets = model.pageWidthTargets;
       ensureHandles();
-      if (routeChanged) clearSize();
       restoreSize();
     } else {
       ensureHandles();
     }
 
-    if (isFullscreenLike()) clearSize();
+    const suspended = isFullscreenLike();
+    player.classList.toggle(DISABLED_CLASS, suspended);
+    if (suspended) {
+      if (!layoutSuspended) clearSize();
+      layoutSuspended = true;
+      return;
+    }
+
+    if (layoutSuspended) {
+      layoutSuspended = false;
+      restoreSize();
+    }
   }
 
   function scheduleRefresh() {
@@ -357,6 +465,26 @@
     GM_addStyle(`
       .${SCRIPT_CLASS} {
         outline: 0 solid transparent;
+        overflow: visible !important;
+      }
+
+      .${SCRIPT_CLASS}.${DISABLED_CLASS} .${HANDLE_CLASS} {
+        display: none !important;
+      }
+
+      .${SCRIPT_CLASS} .bpx-player-container,
+      .${SCRIPT_CLASS} .bilibili-player,
+      .${SCRIPT_CLASS} .bilibili-player-area,
+      .${SCRIPT_CLASS} .bilibili-player-video-wrap,
+      .${SCRIPT_CLASS} .bpx-player-video-area,
+      .${SCRIPT_CLASS} .bpx-player-video-wrap {
+        max-width: 100% !important;
+      }
+
+      .${SCRIPT_CLASS} video {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: contain !important;
       }
 
       .${SCRIPT_CLASS} .${HANDLE_CLASS} {
@@ -365,85 +493,163 @@
         background: transparent;
         pointer-events: auto;
         touch-action: none;
-        opacity: 0;
-        transition: opacity .16s ease, background-color .16s ease;
-      }
-
-      .${SCRIPT_CLASS}:hover .${HANDLE_CLASS},
-      html.${ACTIVE_CLASS} .${SCRIPT_CLASS} .${HANDLE_CLASS} {
         opacity: 1;
       }
 
-      .${SCRIPT_CLASS}:hover .${HANDLE_CLASS}::after,
-      html.${ACTIVE_CLASS} .${SCRIPT_CLASS} .${HANDLE_CLASS}::after {
+      .${SCRIPT_CLASS} .${HANDLE_CLASS}::after {
         content: "";
         position: absolute;
-        inset: 0;
-        background: rgba(0, 174, 236, .28);
+        opacity: 0;
+        pointer-events: none;
+        transition: opacity .14s ease, transform .14s ease;
+      }
+
+      .${SCRIPT_CLASS} .${HANDLE_CLASS}:hover::after,
+      html.${ACTIVE_CLASS} .${SCRIPT_CLASS} .${HANDLE_CLASS}::after {
+        opacity: .95;
+      }
+
+      .${SCRIPT_CLASS}:hover .bvr-se::after {
+        opacity: .42;
       }
 
       .${SCRIPT_CLASS} .bvr-n {
-        top: 0;
-        left: ${EDGE_SIZE * 2}px;
-        right: ${EDGE_SIZE * 2}px;
+        top: -${Math.floor(EDGE_SIZE / 2)}px;
+        left: ${EDGE_SIZE * 3}px;
+        right: ${EDGE_SIZE * 3}px;
         height: ${EDGE_SIZE}px;
         cursor: ns-resize;
+      }
+
+      .${SCRIPT_CLASS} .bvr-n::after,
+      .${SCRIPT_CLASS} .bvr-s::after {
+        left: 42%;
+        right: 42%;
+        height: 2px;
+        border-radius: 999px;
+        background: rgba(0, 174, 236, .85);
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, .35);
+      }
+
+      .${SCRIPT_CLASS} .bvr-n::after {
+        top: 6px;
       }
 
       .${SCRIPT_CLASS} .bvr-s {
-        left: ${EDGE_SIZE * 2}px;
-        right: ${EDGE_SIZE * 2}px;
-        bottom: 0;
+        left: ${EDGE_SIZE * 3}px;
+        right: ${EDGE_SIZE * 3}px;
+        bottom: -${Math.floor(EDGE_SIZE / 2)}px;
         height: ${EDGE_SIZE}px;
         cursor: ns-resize;
       }
 
+      .${SCRIPT_CLASS} .bvr-s::after {
+        bottom: 6px;
+      }
+
       .${SCRIPT_CLASS} .bvr-e {
-        top: ${EDGE_SIZE * 2}px;
-        right: 0;
-        bottom: ${EDGE_SIZE * 2}px;
+        top: ${EDGE_SIZE * 3}px;
+        right: -${Math.floor(EDGE_SIZE / 2)}px;
+        bottom: ${EDGE_SIZE * 3}px;
         width: ${EDGE_SIZE}px;
         cursor: ew-resize;
       }
 
+      .${SCRIPT_CLASS} .bvr-e::after,
+      .${SCRIPT_CLASS} .bvr-w::after {
+        top: 42%;
+        bottom: 42%;
+        width: 2px;
+        border-radius: 999px;
+        background: rgba(0, 174, 236, .85);
+        box-shadow: 0 0 0 1px rgba(255, 255, 255, .35);
+      }
+
+      .${SCRIPT_CLASS} .bvr-e::after {
+        right: 6px;
+      }
+
       .${SCRIPT_CLASS} .bvr-w {
-        top: ${EDGE_SIZE * 2}px;
-        left: 0;
-        bottom: ${EDGE_SIZE * 2}px;
+        top: ${EDGE_SIZE * 3}px;
+        left: -${Math.floor(EDGE_SIZE / 2)}px;
+        bottom: ${EDGE_SIZE * 3}px;
         width: ${EDGE_SIZE}px;
         cursor: ew-resize;
+      }
+
+      .${SCRIPT_CLASS} .bvr-w::after {
+        left: 6px;
       }
 
       .${SCRIPT_CLASS} .bvr-ne,
       .${SCRIPT_CLASS} .bvr-nw,
       .${SCRIPT_CLASS} .bvr-se,
       .${SCRIPT_CLASS} .bvr-sw {
-        width: ${EDGE_SIZE * 2}px;
-        height: ${EDGE_SIZE * 2}px;
+        width: ${EDGE_SIZE * 3}px;
+        height: ${EDGE_SIZE * 3}px;
+      }
+
+      .${SCRIPT_CLASS} .bvr-ne::after,
+      .${SCRIPT_CLASS} .bvr-nw::after,
+      .${SCRIPT_CLASS} .bvr-se::after,
+      .${SCRIPT_CLASS} .bvr-sw::after {
+        width: 18px;
+        height: 18px;
+        border-color: rgba(0, 174, 236, .9);
+        border-style: solid;
+        box-sizing: border-box;
       }
 
       .${SCRIPT_CLASS} .bvr-ne {
-        top: 0;
-        right: 0;
+        top: -${Math.floor(EDGE_SIZE / 2)}px;
+        right: -${Math.floor(EDGE_SIZE / 2)}px;
         cursor: nesw-resize;
+      }
+
+      .${SCRIPT_CLASS} .bvr-ne::after {
+        top: 7px;
+        right: 7px;
+        border-width: 2px 2px 0 0;
+        border-radius: 0 5px 0 0;
       }
 
       .${SCRIPT_CLASS} .bvr-nw {
-        top: 0;
-        left: 0;
+        top: -${Math.floor(EDGE_SIZE / 2)}px;
+        left: -${Math.floor(EDGE_SIZE / 2)}px;
         cursor: nwse-resize;
+      }
+
+      .${SCRIPT_CLASS} .bvr-nw::after {
+        top: 7px;
+        left: 7px;
+        border-width: 2px 0 0 2px;
+        border-radius: 5px 0 0 0;
       }
 
       .${SCRIPT_CLASS} .bvr-se {
-        right: 0;
-        bottom: 0;
+        right: -${Math.floor(EDGE_SIZE / 2)}px;
+        bottom: -${Math.floor(EDGE_SIZE / 2)}px;
         cursor: nwse-resize;
       }
 
+      .${SCRIPT_CLASS} .bvr-se::after {
+        right: 7px;
+        bottom: 7px;
+        border-width: 0 2px 2px 0;
+        border-radius: 0 0 5px 0;
+      }
+
       .${SCRIPT_CLASS} .bvr-sw {
-        left: 0;
-        bottom: 0;
+        left: -${Math.floor(EDGE_SIZE / 2)}px;
+        bottom: -${Math.floor(EDGE_SIZE / 2)}px;
         cursor: nesw-resize;
+      }
+
+      .${SCRIPT_CLASS} .bvr-sw::after {
+        left: 7px;
+        bottom: 7px;
+        border-width: 0 0 2px 2px;
+        border-radius: 0 0 0 5px;
       }
 
       .${SCRIPT_CLASS} .bvr-hint {
@@ -469,7 +675,7 @@
 
       html.${ACTIVE_CLASS},
       html.${ACTIVE_CLASS} body {
-        cursor: inherit !important;
+        cursor: var(--bvr-cursor, default) !important;
         user-select: none !important;
       }
     `);
