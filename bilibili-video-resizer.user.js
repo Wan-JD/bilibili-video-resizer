@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站视频自由缩放
 // @namespace    https://github.com/Wan-JD/bilibili-video-resizer
-// @version      1.1.0
+// @version      1.1.1
 // @description  在 B 站普通网页模式下拖动播放器边框，自由拉伸整块播放区域的画幅比例与尺寸。
 // @author       Wan-JD
 // @license      MIT
@@ -130,6 +130,17 @@
         // Ignore storage failures. The current drag should still work.
       }
     }
+  }
+
+  function addStyle(css) {
+    if (typeof GM_addStyle === 'function') {
+      GM_addStyle(css);
+      return;
+    }
+
+    const style = document.createElement('style');
+    style.textContent = css;
+    document.head.appendChild(style);
   }
 
   function pruneStorage(store) {
@@ -288,6 +299,42 @@
       width: Math.min(Math.max(Math.round(width), minWidth), maxWidth),
       height: Math.min(Math.max(Math.round(height), minHeight), maxHeight),
     };
+  }
+
+  function clampRatioSize(width, height, direction, ratio) {
+    if (!ratio || !Number.isFinite(ratio)) return clampSize(width, height);
+
+    const { minWidth, minHeight, maxWidth, maxHeight } = getBounds();
+    const widthFirst = direction === 'e' || direction === 'w';
+    const heightFirst = direction === 'n' || direction === 's';
+    const widthDelta = Math.abs(width - dragState.startWidth) / Math.max(1, dragState.startWidth);
+    const heightDelta = Math.abs(height - dragState.startHeight) / Math.max(1, dragState.startHeight);
+    let nextWidth = width;
+    let nextHeight = height;
+
+    if (widthFirst || (!heightFirst && widthDelta >= heightDelta)) {
+      nextWidth = Math.min(Math.max(Math.round(width), minWidth), maxWidth);
+      nextHeight = nextWidth / ratio;
+      if (nextHeight > maxHeight) {
+        nextHeight = maxHeight;
+        nextWidth = nextHeight * ratio;
+      } else if (nextHeight < minHeight) {
+        nextHeight = minHeight;
+        nextWidth = nextHeight * ratio;
+      }
+    } else {
+      nextHeight = Math.min(Math.max(Math.round(height), minHeight), maxHeight);
+      nextWidth = nextHeight * ratio;
+      if (nextWidth > maxWidth) {
+        nextWidth = maxWidth;
+        nextHeight = nextWidth / ratio;
+      } else if (nextWidth < minWidth) {
+        nextWidth = minWidth;
+        nextHeight = nextWidth / ratio;
+      }
+    }
+
+    return clampSize(nextWidth, nextHeight);
   }
 
   function applySize(width, height, persist = true) {
@@ -490,7 +537,7 @@
       nextHeight = ratioSize.height;
     }
 
-    const size = clampSize(nextWidth, nextHeight);
+    const size = keepRatio ? clampRatioSize(nextWidth, nextHeight, dir, dragState.ratio) : clampSize(nextWidth, nextHeight);
     queueResize(size.width, size.height, keepRatio);
   }
 
@@ -573,7 +620,7 @@
   }
 
   function installStyles() {
-    GM_addStyle(`
+    addStyle(`
       .${SCRIPT_CLASS} {
         outline: 0 solid transparent;
         overflow: visible !important;
