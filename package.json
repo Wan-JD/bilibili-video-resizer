@@ -1,0 +1,12 @@
+{
+  "name": "bilibili-video-resizer",
+  "version": "1.1.0",
+  "private": true,
+  "description": "Tampermonkey script for freely resizing Bilibili video player frames.",
+  "scripts": {
+    "test": "node tests/resizer-regression.test.js"
+  },
+  "devDependencies": {
+    "playwright": "^1.60.0"
+  }
+}

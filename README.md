@@ -42,6 +42,15 @@
 - 不上传任何数据。
 - 尺寸记录仅保存在 Tampermonkey 本地存储中。
 
+## 开发验证
+
+```text
+npm install
+npm test
+```
+
+测试会在 Chromium 中注入当前用户脚本，覆盖主播放器识别、整块播放区横向缩放、纵向缩放、`Shift` 等比缩放和双击重置。
+
 ## 许可
 
 [MIT](LICENSE)
