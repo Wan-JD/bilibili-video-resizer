@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         B站视频自由缩放
 // @namespace    https://github.com/Wan-JD/bilibili-video-resizer
-// @version      1.0.1
+// @version      1.1.0
 // @description  在 B 站普通网页模式下拖动播放器边框，自由拉伸整块播放区域的画幅比例与尺寸。
 // @author       Wan-JD
 // @license      MIT
@@ -32,6 +32,10 @@
   const MIN_HEIGHT = 236;
   const EDGE_SIZE = 14;
   const SAVE_DELAY = 160;
+  const REFRESH_DELAY = 180;
+  const STORAGE_MAX_ENTRIES = 120;
+  const RIGHT_GUTTER = 18;
+  const BOTTOM_GUTTER = 64;
   const PLAYER_SURFACE_SELECTORS = [
     '.bpx-player-container',
     '#bilibili-player',
@@ -91,22 +95,34 @@
   let observer = null;
   let routeTimer = null;
   let saveTimer = null;
+  let resizeRaf = null;
+  let pendingResize = null;
+  let lastAppliedSize = null;
   let currentVideoKey = null;
   let dragState = null;
   let layoutSuspended = false;
 
   function getStorage() {
     try {
-      const value = GM_getValue(STORAGE_KEY, {});
+      const value = typeof GM_getValue === 'function' ? GM_getValue(STORAGE_KEY, {}) : localStorage.getItem(STORAGE_KEY);
+      if (typeof value === 'string') return JSON.parse(value || '{}');
       return value && typeof value === 'object' ? value : {};
     } catch {
-      return {};
+      try {
+        return JSON.parse(localStorage.getItem(STORAGE_KEY) || '{}');
+      } catch {
+        return {};
+      }
     }
   }
 
   function setStorage(value) {
     try {
-      GM_setValue(STORAGE_KEY, value);
+      if (typeof GM_setValue === 'function') {
+        GM_setValue(STORAGE_KEY, value);
+      } else {
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
+      }
     } catch {
       try {
         localStorage.setItem(STORAGE_KEY, JSON.stringify(value));
@@ -114,6 +130,17 @@
         // Ignore storage failures. The current drag should still work.
       }
     }
+  }
+
+  function pruneStorage(store) {
+    const entries = Object.entries(store || {});
+    if (entries.length <= STORAGE_MAX_ENTRIES) return store;
+
+    entries
+      .sort((a, b) => (b[1]?.updatedAt || 0) - (a[1]?.updatedAt || 0))
+      .slice(STORAGE_MAX_ENTRIES)
+      .forEach(([key]) => delete store[key]);
+    return store;
   }
 
   function getVideoKey() {
@@ -154,8 +181,25 @@
     return nodes;
   }
 
+  function rectArea(el) {
+    const rect = el?.getBoundingClientRect?.();
+    if (!rect || rect.width <= 0 || rect.height <= 0) return 0;
+    return rect.width * rect.height;
+  }
+
+  function findMainVideo() {
+    const visibleVideos = Array.from(document.querySelectorAll('.bpx-player-container video, #bilibili-player video, video'))
+      .filter((video) => video instanceof HTMLElement)
+      .filter((video) => rectArea(video) > 0);
+
+    if (!visibleVideos.length) return null;
+    const videos = visibleVideos.filter((video) => rectArea(video) > 240 * 130);
+    if (!videos.length) return visibleVideos.reduce((best, video) => (rectArea(video) > rectArea(best) ? video : best));
+    return videos.reduce((best, video) => (rectArea(video) > rectArea(best) ? video : best));
+  }
+
   function findPlayer() {
-    const video = document.querySelector('.bpx-player-container video, #bilibili-player video, video');
+    const video = findMainVideo();
     if (!video) return null;
     const candidates = collectAncestors(video)
       .filter((el) => matchesAny(el, PLAYER_FRAME_SELECTORS))
@@ -222,16 +266,27 @@
   }
 
   function getBounds() {
-    const maxWidth = Math.max(MIN_WIDTH, Math.floor(window.innerWidth - 32));
-    const maxHeight = Math.max(MIN_HEIGHT, Math.floor(window.innerHeight - 96));
-    return { maxWidth, maxHeight };
+    const rect = player?.getBoundingClientRect?.();
+    const left = rect ? Math.max(0, rect.left) : 0;
+    const top = rect ? Math.max(0, rect.top) : 0;
+    const viewportWidthLimit = Math.floor(window.innerWidth - left - RIGHT_GUTTER);
+    const viewportHeightLimit = Math.floor(window.innerHeight - top - BOTTOM_GUTTER);
+    const relaxedHeightLimit = Math.floor(Math.max(viewportHeightLimit, window.innerWidth * 0.72));
+    const maxWidth = Math.max(300, Math.min(1920, viewportWidthLimit));
+    const maxHeight = Math.max(170, Math.min(1200, relaxedHeightLimit));
+    return {
+      minWidth: Math.min(MIN_WIDTH, maxWidth),
+      minHeight: Math.min(MIN_HEIGHT, maxHeight),
+      maxWidth,
+      maxHeight,
+    };
   }
 
   function clampSize(width, height) {
-    const { maxWidth, maxHeight } = getBounds();
+    const { minWidth, minHeight, maxWidth, maxHeight } = getBounds();
     return {
-      width: Math.min(Math.max(Math.round(width), MIN_WIDTH), maxWidth),
-      height: Math.min(Math.max(Math.round(height), MIN_HEIGHT), maxHeight),
+      width: Math.min(Math.max(Math.round(width), minWidth), maxWidth),
+      height: Math.min(Math.max(Math.round(height), minHeight), maxHeight),
     };
   }
 
@@ -255,7 +310,9 @@
 
     document.documentElement.style.setProperty('--bvr-width', `${size.width}px`);
     document.documentElement.style.setProperty('--bvr-height', `${size.height}px`);
+    lastAppliedSize = size;
     if (persist) scheduleSave(size);
+    return size;
   }
 
   function clearSize() {
@@ -273,6 +330,7 @@
     });
     document.documentElement.style.removeProperty('--bvr-width');
     document.documentElement.style.removeProperty('--bvr-height');
+    lastAppliedSize = null;
   }
 
   function scheduleSave(size) {
@@ -284,7 +342,7 @@
         height: size.height,
         updatedAt: Date.now(),
       };
-      setStorage(store);
+      setStorage(pruneStorage(store));
     }, SAVE_DELAY);
   }
 
@@ -311,6 +369,37 @@
     if (direction === 'e' || direction === 'w') return 'ew-resize';
     if (direction === 'ne' || direction === 'sw') return 'nesw-resize';
     return 'nwse-resize';
+  }
+
+  function formatSize(size, keepRatio = false) {
+    if (!size) return '';
+    return `${size.width} x ${size.height}${keepRatio ? ' | Shift 锁定比例' : ''}`;
+  }
+
+  function keepAspectRatio(width, height, direction, ratio) {
+    if (!ratio || !Number.isFinite(ratio)) return { width, height };
+
+    if (direction === 'e' || direction === 'w') return { width, height: width / ratio };
+    if (direction === 'n' || direction === 's') return { width: height * ratio, height };
+
+    const widthDelta = Math.abs(width - dragState.startWidth) / Math.max(1, dragState.startWidth);
+    const heightDelta = Math.abs(height - dragState.startHeight) / Math.max(1, dragState.startHeight);
+    if (widthDelta >= heightDelta) return { width, height: width / ratio };
+    return { width: height * ratio, height };
+  }
+
+  function queueResize(width, height, keepRatio) {
+    pendingResize = { width, height, keepRatio };
+    if (resizeRaf) return;
+
+    resizeRaf = requestAnimationFrame(() => {
+      resizeRaf = null;
+      const next = pendingResize;
+      pendingResize = null;
+      if (!next) return;
+      const size = applySize(next.width, next.height, false);
+      if (size) showHint(formatSize(size, next.keepRatio));
+    });
   }
 
   function showHint(text) {
@@ -340,7 +429,8 @@
       const handle = document.createElement('div');
       handle.className = `${HANDLE_CLASS} bvr-${direction}`;
       handle.dataset.direction = direction;
-      handle.title = '拖动缩放整块播放区域，双击重置';
+      handle.title = '拖动缩放整块播放区域，按住 Shift 保持比例，双击重置';
+      handle.setAttribute('aria-hidden', 'true');
       handle.addEventListener('pointerdown', startResize);
       handle.addEventListener('dblclick', (event) => {
         event.preventDefault();
@@ -364,6 +454,7 @@
       startY: event.clientY,
       startWidth: rect.width,
       startHeight: rect.height,
+      ratio: rect.width / Math.max(1, rect.height),
     };
 
     event.preventDefault();
@@ -392,21 +483,38 @@
     if (dir.includes('s')) nextHeight += dy;
     if (dir.includes('n')) nextHeight -= dy;
 
+    const keepRatio = event.shiftKey;
+    if (keepRatio) {
+      const ratioSize = keepAspectRatio(nextWidth, nextHeight, dir, dragState.ratio);
+      nextWidth = ratioSize.width;
+      nextHeight = ratioSize.height;
+    }
+
     const size = clampSize(nextWidth, nextHeight);
-    applySize(size.width, size.height);
-    showHint(`${size.width} x ${size.height}`);
+    queueResize(size.width, size.height, keepRatio);
   }
 
   function stopResize(event) {
     if (!dragState) return;
     event?.preventDefault?.();
     event?.stopPropagation?.();
+    if (resizeRaf) {
+      cancelAnimationFrame(resizeRaf);
+      resizeRaf = null;
+      if (pendingResize) {
+        const size = applySize(pendingResize.width, pendingResize.height, false);
+        if (size) showHint(formatSize(size, pendingResize.keepRatio));
+        pendingResize = null;
+      }
+    }
+    if (lastAppliedSize) scheduleSave(lastAppliedSize);
     dragState = null;
     document.documentElement.classList.remove(ACTIVE_CLASS);
     document.documentElement.style.removeProperty('--bvr-cursor');
     document.removeEventListener('pointermove', onResizeMove, true);
     document.removeEventListener('pointerup', stopResize, true);
     document.removeEventListener('pointercancel', stopResize, true);
+    scheduleRefresh();
   }
 
   function cleanupPlayer(el) {
@@ -448,8 +556,11 @@
   }
 
   function scheduleRefresh() {
-    clearTimeout(routeTimer);
-    routeTimer = setTimeout(refresh, 120);
+    if (dragState || routeTimer) return;
+    routeTimer = setTimeout(() => {
+      routeTimer = null;
+      refresh();
+    }, REFRESH_DELAY);
   }
 
   function watchRouteChanges() {
